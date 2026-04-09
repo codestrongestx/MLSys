@@ -1,0 +1,10 @@
+# Build outputs
+/source/mlsys
+/source/*.o
+/source/*.d
+/out/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*~
