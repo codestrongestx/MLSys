@@ -312,6 +312,7 @@ struct Plan {
   std::vector<int> ops;
   Granularity granularity;
   std::optional<std::vector<int>> traversal_order;
+  std::vector<int> tensors_to_retain;
   double latency = kInf;
 
   double Score() const {
@@ -607,7 +608,9 @@ std::optional<int> SingleOutputTensor(const Problem& problem,
   return last.outputs[0];
 }
 
-Plan EvaluatePointwiseChain(const Problem& problem, const std::vector<int>& ops) {
+Plan EvaluatePointwiseChain(const Problem& problem, const std::vector<int>& ops,
+                            const std::unordered_set<int>& retained_inputs,
+                            bool retain_final_output) {
   Plan best;
   best.ops = ops;
 
@@ -617,6 +620,15 @@ Plan EvaluatePointwiseChain(const Problem& problem, const std::vector<int>& ops)
   }
   const Tensor& output = problem.tensors[*output_tensor_id];
   const std::vector<int> external_inputs = ExternalInputs(problem, ops);
+  const i64 retained_input_bytes = [&]() {
+    i64 bytes = 0;
+    for (int tensor_id : external_inputs) {
+      if (retained_inputs.count(tensor_id)) {
+        bytes += problem.tensors[tensor_id].width * problem.tensors[tensor_id].height;
+      }
+    }
+    return bytes;
+  }();
 
   i64 compute_cost = 0;
   for (int op_index : ops) {
@@ -640,17 +652,22 @@ Plan EvaluatePointwiseChain(const Problem& problem, const std::vector<int>& ops)
           const i64 tile_w = std::min(w, output.width - tile_c * w);
           i64 external_bytes = 0;
           for (int tensor_id : external_inputs) {
-            (void)tensor_id;
-            external_bytes += tile_h * tile_w;
+            if (!retained_inputs.count(tensor_id)) {
+              external_bytes += tile_h * tile_w;
+            }
           }
           const i64 output_bytes = tile_h * tile_w;
-          const i64 working_set = external_bytes + output_bytes;
+          const i64 reserved_output_bytes =
+              retain_final_output ? output.width * output.height : output_bytes;
+          const i64 working_set =
+              retained_input_bytes + external_bytes + reserved_output_bytes;
           if (working_set > problem.fast_memory_capacity) {
             feasible = false;
             break;
           }
           latency += std::max(static_cast<double>(compute_cost),
-                              BytesToTime(external_bytes + output_bytes,
+                              BytesToTime(external_bytes +
+                                              (retain_final_output ? 0 : output_bytes),
                                           problem.slow_memory_bandwidth));
         }
       }
@@ -660,6 +677,9 @@ Plan EvaluatePointwiseChain(const Problem& problem, const std::vector<int>& ops)
       if (latency < best.latency) {
         best.granularity = Granularity{w, h, 1};
         best.traversal_order = std::nullopt;
+        best.tensors_to_retain =
+            retain_final_output ? std::vector<int>{*output_tensor_id}
+                                : std::vector<int>{};
         best.latency = latency;
       }
     }
@@ -670,6 +690,7 @@ Plan EvaluatePointwiseChain(const Problem& problem, const std::vector<int>& ops)
 double EvaluateMatmulNoSplitWithTraversal(
     const Problem& problem, const Op& matmul_op,
     const std::vector<int>& extra_pointwise_inputs, double extra_compute_cost,
+    const std::unordered_set<int>& retained_inputs, bool retain_final_output,
     i64 output_width, i64 output_height, i64 w, i64 h,
     const std::vector<std::pair<int, int>>& traversal) {
   const Tensor& lhs = problem.tensors[matmul_op.inputs[0]];
@@ -688,6 +709,24 @@ double EvaluateMatmulNoSplitWithTraversal(
     return kInf;
   }
 
+  const bool lhs_retained = retained_inputs.count(matmul_op.inputs[0]) != 0;
+  const bool rhs_retained = retained_inputs.count(matmul_op.inputs[1]) != 0;
+  i64 retained_input_bytes = 0;
+  if (lhs_retained) {
+    retained_input_bytes += lhs.width * lhs.height;
+  }
+  if (rhs_retained) {
+    retained_input_bytes += rhs.width * rhs.height;
+  }
+  for (int tensor_id : extra_pointwise_inputs) {
+    if (retained_inputs.count(tensor_id)) {
+      retained_input_bytes +=
+          problem.tensors[tensor_id].width * problem.tensors[tensor_id].height;
+    }
+  }
+  const i64 reserved_output_bytes =
+      retain_final_output ? output_width * output_height : 0;
+
   int cached_row = -1;
   int cached_col = -1;
   double total_latency = 0.0;
@@ -700,25 +739,29 @@ double EvaluateMatmulNoSplitWithTraversal(
     const i64 output_bytes = tile_h * tile_w;
     i64 pointwise_bytes = 0;
     for (int tensor_id : extra_pointwise_inputs) {
-      (void)tensor_id;
-      pointwise_bytes += output_bytes;
+      if (!retained_inputs.count(tensor_id)) {
+        pointwise_bytes += output_bytes;
+      }
     }
     const i64 working_set =
-        row_bytes + col_bytes + pointwise_bytes + output_bytes;
+        retained_input_bytes + (lhs_retained ? 0 : row_bytes) +
+        (rhs_retained ? 0 : col_bytes) + pointwise_bytes +
+        (retain_final_output ? reserved_output_bytes : output_bytes);
     if (working_set > problem.fast_memory_capacity) {
       return kInf;
     }
 
-    i64 load_bytes = pointwise_bytes + output_bytes;
-    if (cached_row != row) {
+    i64 load_bytes = pointwise_bytes;
+    if (!lhs_retained && cached_row != row) {
       load_bytes += row_bytes;
     }
-    if (cached_col != col) {
+    if (!rhs_retained && cached_col != col) {
       load_bytes += col_bytes;
     }
     total_latency +=
         std::max(compute_cost,
-                 BytesToTime(load_bytes, problem.slow_memory_bandwidth));
+                 BytesToTime(load_bytes + (retain_final_output ? 0 : output_bytes),
+                             problem.slow_memory_bandwidth));
     cached_row = row;
     cached_col = col;
   }
@@ -727,7 +770,9 @@ double EvaluateMatmulNoSplitWithTraversal(
 
 Plan EvaluateMatmulWithOptionalPointwiseTail(const Problem& problem,
                                              const std::vector<int>& ops,
-                                             bool allow_tail) {
+                                             bool allow_tail,
+                                             const std::unordered_set<int>& retained_inputs,
+                                             bool retain_final_output) {
   Plan best;
   best.ops = ops;
 
@@ -771,12 +816,12 @@ Plan EvaluateMatmulWithOptionalPointwiseTail(const Problem& problem,
         const auto snake = SnakeOrder(CeilDiv(output.height, h), CeilDiv(output.width, w));
         const double raster_latency = EvaluateMatmulNoSplitWithTraversal(
             problem, root, extra_pointwise_inputs,
-            static_cast<double>(pointwise_compute), output.width, output.height,
-            w, h, raster);
+            static_cast<double>(pointwise_compute), retained_inputs,
+            retain_final_output, output.width, output.height, w, h, raster);
         const double snake_latency = EvaluateMatmulNoSplitWithTraversal(
             problem, root, extra_pointwise_inputs,
-            static_cast<double>(pointwise_compute), output.width, output.height,
-            w, h, snake);
+            static_cast<double>(pointwise_compute), retained_inputs,
+            retain_final_output, output.width, output.height, w, h, snake);
         double latency = raster_latency;
         std::optional<std::vector<int>> traversal;
         if (snake_latency < latency) {
@@ -789,6 +834,9 @@ Plan EvaluateMatmulWithOptionalPointwiseTail(const Problem& problem,
         if (latency < best.latency) {
           best.granularity = Granularity{w, h, k_dim};
           best.traversal_order = traversal;
+          best.tensors_to_retain =
+              retain_final_output ? std::vector<int>{*output_tensor_id}
+                                  : std::vector<int>{};
           best.latency = latency;
         }
         continue;
@@ -802,11 +850,11 @@ Plan EvaluateMatmulWithOptionalPointwiseTail(const Problem& problem,
           const auto raster = RasterOrder(rows, cols);
           const auto snake = SnakeOrder(rows, cols);
           double raster_latency = EvaluateMatmulNoSplitWithTraversal(
-              problem, root, {}, 0.0, output.width, output.height, w, h,
-              raster);
+              problem, root, {}, 0.0, retained_inputs, retain_final_output,
+              output.width, output.height, w, h, raster);
           double snake_latency = EvaluateMatmulNoSplitWithTraversal(
-              problem, root, {}, 0.0, output.width, output.height, w, h,
-              snake);
+              problem, root, {}, 0.0, retained_inputs, retain_final_output,
+              output.width, output.height, w, h, snake);
           double latency = raster_latency;
           std::optional<std::vector<int>> traversal;
           if (snake_latency < latency) {
@@ -819,12 +867,28 @@ Plan EvaluateMatmulWithOptionalPointwiseTail(const Problem& problem,
           if (latency < best.latency) {
             best.granularity = Granularity{w, h, k};
             best.traversal_order = traversal;
+            best.tensors_to_retain =
+                retain_final_output ? std::vector<int>{*output_tensor_id}
+                                    : std::vector<int>{};
             best.latency = latency;
           }
           continue;
         }
 
         const i64 red_steps = CeilDiv(k_dim, k);
+        const bool lhs_retained = retained_inputs.count(root.inputs[0]) != 0;
+        const bool rhs_retained = retained_inputs.count(root.inputs[1]) != 0;
+        i64 retained_input_bytes = 0;
+        if (lhs_retained) {
+          retained_input_bytes += lhs.width * lhs.height;
+        }
+        if (rhs_retained) {
+          retained_input_bytes +=
+              problem.tensors[root.inputs[1]].width *
+              problem.tensors[root.inputs[1]].height;
+        }
+        const i64 reserved_output_bytes =
+            retain_final_output ? output.width * output.height : 0;
         double latency = 0.0;
         bool feasible = true;
         for (int row = 0; row < rows && feasible; ++row) {
@@ -839,19 +903,25 @@ Plan EvaluateMatmulWithOptionalPointwiseTail(const Problem& problem,
               const i64 lhs_bytes = tile_h * step_k;
               const i64 rhs_bytes = step_k * tile_w;
               const i64 output_bytes = tile_h * tile_w;
-              const i64 working_set = lhs_bytes + rhs_bytes + output_bytes;
+              const i64 working_set =
+                  retained_input_bytes + (lhs_retained ? 0 : lhs_bytes) +
+                  (rhs_retained ? 0 : rhs_bytes) +
+                  (retain_final_output ? reserved_output_bytes : output_bytes);
               if (working_set > problem.fast_memory_capacity) {
                 feasible = false;
                 break;
               }
-              const i64 store_bytes = (step + 1 == red_steps) ? output_bytes : 0;
+              const i64 store_bytes =
+                  (step + 1 == red_steps && !retain_final_output) ? output_bytes
+                                                                  : 0;
               const double compute =
                   static_cast<double>(root.base_cost) *
                   static_cast<double>(step_k) /
                   static_cast<double>(problem.native_width);
               latency += std::max(
                   compute,
-                  BytesToTime(lhs_bytes + rhs_bytes + store_bytes,
+                  BytesToTime((lhs_retained ? 0 : lhs_bytes) +
+                                  (rhs_retained ? 0 : rhs_bytes) + store_bytes,
                               problem.slow_memory_bandwidth));
             }
           }
@@ -862,6 +932,9 @@ Plan EvaluateMatmulWithOptionalPointwiseTail(const Problem& problem,
         if (latency < best.latency) {
           best.granularity = Granularity{w, h, k};
           best.traversal_order = std::nullopt;
+          best.tensors_to_retain =
+              retain_final_output ? std::vector<int>{*output_tensor_id}
+                                  : std::vector<int>{};
           best.latency = latency;
         }
       }
@@ -870,20 +943,34 @@ Plan EvaluateMatmulWithOptionalPointwiseTail(const Problem& problem,
   return best;
 }
 
-Plan BestPlanForChain(const Problem& problem, const std::vector<int>& chain) {
+Plan EvaluatePlanForOps(const Problem& problem, const std::vector<int>& ops,
+                        const std::unordered_set<int>& retained_inputs,
+                        bool retain_final_output) {
+  if (ops.empty()) {
+    return Plan();
+  }
+  if (IsPointwise(problem.ops[ops.front()])) {
+    return EvaluatePointwiseChain(problem, ops, retained_inputs,
+                                  retain_final_output);
+  }
+
+  const bool allow_tail = ops.size() > 1;
+  Plan candidate = EvaluateMatmulWithOptionalPointwiseTail(
+      problem, ops, allow_tail, retained_inputs, retain_final_output);
+  if (!std::isfinite(candidate.latency) && allow_tail) {
+    return EvaluateMatmulWithOptionalPointwiseTail(
+        problem, {ops.front()}, false, retained_inputs, retain_final_output);
+  }
+  return candidate;
+}
+
+Plan BestPlanForChain(const Problem& problem, const std::vector<int>& chain,
+                      const std::unordered_set<int>& retained_inputs) {
   Plan best;
   for (std::size_t length = 1; length <= chain.size(); ++length) {
     std::vector<int> prefix(chain.begin(), chain.begin() + static_cast<long>(length));
-    Plan candidate;
-    if (IsPointwise(problem.ops[prefix.front()])) {
-      candidate = EvaluatePointwiseChain(problem, prefix);
-    } else if (IsMatMul(problem.ops[prefix.front()])) {
-      const bool allow_tail = prefix.size() > 1;
-      candidate = EvaluateMatmulWithOptionalPointwiseTail(problem, prefix, allow_tail);
-      if (!std::isfinite(candidate.latency) && allow_tail) {
-        candidate = EvaluateMatmulWithOptionalPointwiseTail(problem, {prefix.front()}, false);
-      }
-    }
+    Plan candidate =
+        EvaluatePlanForOps(problem, prefix, retained_inputs, false);
     if (candidate.Score() < best.Score() ||
         (candidate.Score() == best.Score() &&
          candidate.ops.size() > best.ops.size())) {
@@ -894,14 +981,15 @@ Plan BestPlanForChain(const Problem& problem, const std::vector<int>& chain) {
 }
 
 int ChooseNextRoot(const Problem& problem, const std::vector<bool>& scheduled,
-                   const std::vector<int>& ready_ops) {
+                   const std::vector<int>& ready_ops,
+                   const std::unordered_set<int>& retained_inputs) {
   int best_root = ready_ops.front();
   double best_score = kInf;
   std::size_t best_length = 0;
 
   for (int root : ready_ops) {
     const std::vector<int> chain = BuildMaxChain(problem, scheduled, root);
-    const Plan plan = BestPlanForChain(problem, chain);
+    const Plan plan = BestPlanForChain(problem, chain, retained_inputs);
     if (plan.ops.empty() || !std::isfinite(plan.latency)) {
       continue;
     }
@@ -937,6 +1025,7 @@ std::vector<int> InitialReadyOps(const Problem& problem) {
 std::vector<Plan> Solve(const Problem& problem) {
   const int n = static_cast<int>(problem.ops.size());
   std::vector<bool> scheduled(n, false);
+  std::unordered_set<int> retained_inputs;
   std::vector<int> remaining_internal_inputs(n, 0);
   for (int op_index = 0; op_index < n; ++op_index) {
     int count = 0;
@@ -957,14 +1046,13 @@ std::vector<Plan> Solve(const Problem& problem) {
     if (ready_ops.empty()) {
       throw std::runtime_error("No schedulable operations remain");
     }
-    const int root = ChooseNextRoot(problem, scheduled, ready_ops);
+    const int root =
+        ChooseNextRoot(problem, scheduled, ready_ops, retained_inputs);
     const std::vector<int> chain = BuildMaxChain(problem, scheduled, root);
-    Plan plan = BestPlanForChain(problem, chain);
+    Plan plan = BestPlanForChain(problem, chain, retained_inputs);
     if (plan.ops.empty() || !std::isfinite(plan.latency)) {
       throw std::runtime_error("Unable to find a feasible plan for ready op");
     }
-
-    schedule.push_back(plan);
 
     std::unordered_set<int> picked(plan.ops.begin(), plan.ops.end());
     std::vector<int> next_ready;
@@ -994,6 +1082,54 @@ std::vector<Plan> Solve(const Problem& problem) {
       }
     }
 
+    const auto final_output = SingleOutputTensor(problem, plan.ops);
+    Plan best_variant = EvaluatePlanForOps(problem, plan.ops, retained_inputs, false);
+    std::unordered_set<int> next_retained_inputs;
+    double best_objective = best_variant.latency;
+    if (scheduled_count < n && !next_ready.empty()) {
+      const int next_root =
+          ChooseNextRoot(problem, scheduled, next_ready, next_retained_inputs);
+      const std::vector<int> next_chain =
+          BuildMaxChain(problem, scheduled, next_root);
+      best_objective +=
+          BestPlanForChain(problem, next_chain, next_retained_inputs).latency;
+    }
+
+    if (final_output.has_value()) {
+      bool has_future_consumer = false;
+      for (int consumer : problem.consumers[*final_output]) {
+        if (!scheduled[consumer]) {
+          has_future_consumer = true;
+          break;
+        }
+      }
+      if (has_future_consumer) {
+        std::unordered_set<int> candidate_retained{*final_output};
+        Plan retained_variant =
+            EvaluatePlanForOps(problem, plan.ops, retained_inputs, true);
+        if (std::isfinite(retained_variant.latency)) {
+          double objective = retained_variant.latency;
+          if (scheduled_count < n && !next_ready.empty()) {
+            const int next_root = ChooseNextRoot(problem, scheduled, next_ready,
+                                                 candidate_retained);
+            const std::vector<int> next_chain =
+                BuildMaxChain(problem, scheduled, next_root);
+            const Plan next_plan =
+                BestPlanForChain(problem, next_chain, candidate_retained);
+            objective += next_plan.latency;
+          }
+          if (objective < best_objective) {
+            best_objective = objective;
+            best_variant = retained_variant;
+            next_retained_inputs = std::move(candidate_retained);
+          }
+        }
+      }
+    }
+
+    schedule.push_back(best_variant);
+    retained_inputs = std::move(next_retained_inputs);
+
     std::sort(next_ready.begin(), next_ready.end());
     next_ready.erase(std::unique(next_ready.begin(), next_ready.end()),
                      next_ready.end());
@@ -1015,9 +1151,6 @@ void ValidateSolution(const Problem& problem, const std::vector<Plan>& plans) {
     for (int op_index : plan.ops) {
       if (op_index < 0 || op_index >= static_cast<int>(problem.ops.size())) {
         throw std::runtime_error("Operation index out of range");
-      }
-      if (seen[op_index]) {
-        throw std::runtime_error("Operation appears multiple times");
       }
       seen[op_index] = true;
     }
@@ -1061,7 +1194,14 @@ void WriteSolution(const std::string& path, const std::vector<Plan>& plans) {
 
   out << "  \"tensors_to_retain\": [\n";
   for (std::size_t i = 0; i < plans.size(); ++i) {
-    out << "    []";
+    out << "    [";
+    for (std::size_t j = 0; j < plans[i].tensors_to_retain.size(); ++j) {
+      if (j != 0) {
+        out << ", ";
+      }
+      out << plans[i].tensors_to_retain[j];
+    }
+    out << "]";
     out << (i + 1 == plans.size() ? "\n" : ",\n");
   }
   out << "  ],\n";
